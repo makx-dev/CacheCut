@@ -1,8 +1,28 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.redirectUrl = exports.shortenUrl = void 0;
+exports.redirectUrl = exports.shortenUrl = exports.getUrl = void 0;
 const pool_1 = require("../db/pool");
 const generateCode_1 = require("../utils/generateCode");
+const redis_1 = require("../db/redis");
+const getUrl = async (req, res) => {
+    const { code } = req.params;
+    try {
+        const cached = await redis_1.redis.get(`url:${code}`);
+        if (cached)
+            return res.json(JSON.parse(cached));
+        const result = await pool_1.pool.query('SELECT * FROM urls WHERE short_code = $1', [code]);
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Short URL not found' });
+        }
+        await redis_1.redis.set(`url:${code}`, JSON.stringify(result.rows[0]), 'EX', 3600);
+        return res.json(result.rows[0]);
+    }
+    catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: 'Failed to get short URL' });
+    }
+};
+exports.getUrl = getUrl;
 const shortenUrl = async (req, res) => {
     const { og_url } = req.body;
     //case when url isn't filled
@@ -38,6 +58,19 @@ const shortenUrl = async (req, res) => {
 exports.shortenUrl = shortenUrl;
 const redirectUrl = async (req, res) => {
     const { code } = req.params;
+    const cached = await redis_1.redis.get(`url:${code}`);
+    if (cached) {
+        const { og_url } = JSON.parse(cached);
+        await redis_1.redis.incr(`clicks:${code}`); //flush to postgres in batches later
+        return res.redirect(og_url);
+    }
+    else {
+        const result = await pool_1.pool.query('SELECT og_url FROM urls WHERE short_code = $1', [code]);
+        console.log('CACHE MISS');
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Short URL not found' });
+        }
+    }
     try {
         const result = await pool_1.pool.query('UPDATE urls SET click_cnt = click_cnt + 1 WHERE short_code = $1 RETURNING og_url', [code]);
         if (result.rowCount === 0) {
@@ -47,11 +80,11 @@ const redirectUrl = async (req, res) => {
     }
     catch (err) {
         console.error(err);
-        return res.status(500).json({ error: 'Something went wrong' });
+        return res.status(500).json({ error: 'Failed to redirect' });
     }
 };
 exports.redirectUrl = redirectUrl;
-// One gap worth flagging: your :code route will also catch anything that isn't /shorten — including 
-// things like /favicon.ico. Not a real problem now, but worth a mental note for when you add more 
+// One gap worth flagging: your :code route will also catch anything that isn't /shorten — including
+// things like /favicon.ico. Not a real problem now, but worth a mental note for when you add more
 // routes later (put more specific paths before the catch-all :code).
 //# sourceMappingURL=url.controller.js.map

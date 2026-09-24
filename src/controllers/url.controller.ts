@@ -1,9 +1,34 @@
 import { Request, Response } from 'express';
 import { pool } from '../db/pool';
 import { generateCode } from '../utils/generateCode';
+import { redis } from '../db/redis';
+
+export const getUrl = async (req: Request, res: Response) => {
+  const { code } = req.params;
+
+  try {
+    const cached = await redis.get(`url:${code}`);
+    if (cached) return res.json(JSON.parse(cached));
+
+    const result = await pool.query(
+      'SELECT * FROM urls WHERE short_code = $1',
+      [code]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    await redis.set(`url:${code}`, JSON.stringify(result.rows[0]), 'EX', 3600);
+    return res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Failed to get short URL' });
+  }
+};
 
 export const shortenUrl = async (req: Request, res: Response) => {
-  const { og_url } = req.body;           
+  const { og_url } = req.body;
 
   //case when url isn't filled
   if (!og_url || typeof og_url !== 'string') {
@@ -14,14 +39,14 @@ export const shortenUrl = async (req: Request, res: Response) => {
   try {
     new URL(og_url); // throws if invalid
   } catch {
-    return res.status(400).json({ error: 'Invalid URL format' }); 
+    return res.status(400).json({ error: 'Invalid URL format' });
   }
 
   let short_code = generateCode(); //call generateCode
   let attempts = 0;
 
-   // handle collision (rare with 7-char nanoid, but handle it)
- while (attempts < 5) {
+  // handle collision (rare with 7-char nanoid, but handle it)
+  while (attempts < 5) {
     const existing = await pool.query(
       'SELECT 1 FROM urls WHERE short_code = $1',
       [short_code]
@@ -46,6 +71,23 @@ export const shortenUrl = async (req: Request, res: Response) => {
 export const redirectUrl = async (req: Request, res: Response) => {
   const { code } = req.params;
 
+  const cached = await redis.get(`url:${code}`);
+  if (cached) {
+    const { og_url } = JSON.parse(cached);
+    await redis.incr(`clicks:${code}`); //flush to postgres in batches later
+    return res.redirect(og_url);
+  }
+  else {
+    const result = await pool.query(
+      'SELECT og_url FROM urls WHERE short_code = $1',
+      [code]
+    );
+    console.log('CACHE MISS');
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+  }
+
   try {
     const result = await pool.query(
       'UPDATE urls SET click_cnt = click_cnt + 1 WHERE short_code = $1 RETURNING og_url',
@@ -57,14 +99,15 @@ export const redirectUrl = async (req: Request, res: Response) => {
     }
 
     return res.redirect(result.rows[0].og_url);
-  } catch (err) {
+  }
+  catch (err) {
     console.error(err);
-    return res.status(500).json({ error: 'Something went wrong' });
+    return res.status(500).json({ error: 'Failed to redirect' });
   }
 };
 
 
 
-// One gap worth flagging: your :code route will also catch anything that isn't /shorten — including 
-// things like /favicon.ico. Not a real problem now, but worth a mental note for when you add more 
+// One gap worth flagging: your :code route will also catch anything that isn't /shorten — including
+// things like /favicon.ico. Not a real problem now, but worth a mental note for when you add more
 // routes later (put more specific paths before the catch-all :code).
