@@ -1,0 +1,26 @@
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    container_name: url_shortener-redis
+    command: [ "redis-server", "--appendonly", "yes" ]
+
+  postgres:
+    image: postgres:17
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: url_shortener
+
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: "none"
+      o: "bind"
+      device: "./postgres_data"

@@ -34,6 +34,7 @@
 
     // Recommended Options
     "strict": true,
+    "esModuleInterop": true,
     // "jsx": "react-jsx",: Not useful as we are building backend project
     // "verbatimModuleSyntax": true,
     "isolatedModules": true,
