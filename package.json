@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "prestart": "npm run build",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "bench:postgres": "autocannon -c 50 -d 10 http://localhost:3000/1C"
   },
   "repository": {
     "type": "git",
@@ -32,6 +33,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.5.1",
     "@types/pg": "^8.23.1",
+    "autocannon": "^8.0.0",
     "tsx": "^4.19.3",
     "typescript": "^7.0.2"
   }
