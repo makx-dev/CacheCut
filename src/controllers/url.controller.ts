@@ -2,9 +2,18 @@ import { Request, Response } from 'express';
 import { pool } from '../db/pool';
 import { generateCode } from '../utils/generateCode';
 import { redis } from '../db/redis';
+import { LruCache } from '../utils/lruCache';
+import { recordClick } from '../services/clickSync.service';
+
+// Tier-1 In-Memory LRU Cache: stores short_code -> og_url (10,000 entries, 60s TTL)
+const urlL1Cache = new LruCache<string, string>(10000, 60000);
 
 export const getUrl = async (req: Request, res: Response) => {
   const { code } = req.params;
+
+  if (!code || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Invalid short code' });
+  }
 
   try {
     const cached = await redis.get(`url:${code}`);
@@ -61,6 +70,11 @@ export const shortenUrl = async (req: Request, res: Response) => {
       `INSERT INTO urls (short_code, og_url) VALUES ($1, $2) RETURNING short_code, og_url, created_at`,
       [short_code, og_url]
     );
+
+    // Pre-warm Tier-1 (Local LRU) & Tier-2 (Redis) caches
+    urlL1Cache.set(short_code, og_url);
+    await redis.set(`url:${short_code}`, JSON.stringify(result.rows[0]), 'EX', 3600);
+
     return res.status(201).json(result.rows[0]);
   } catch (err) {
     console.error(err);
@@ -71,36 +85,48 @@ export const shortenUrl = async (req: Request, res: Response) => {
 export const redirectUrl = async (req: Request, res: Response) => {
   const { code } = req.params;
 
-  const cached = await redis.get(`url:${code}`);
-  if (cached) {
-    const { og_url } = JSON.parse(cached);
-    await redis.incr(`clicks:${code}`); //flush to postgres in batches later
-    return res.redirect(og_url);
+  if (!code || typeof code !== 'string') {
+    return res.status(400).json({ error: 'Invalid short code' });
   }
-  else {
+
+  try {
+    // --- TIER 1: In-Memory LRU Cache (Sub-microsecond, 0 network overhead) ---
+    const l1Target = urlL1Cache.get(code);
+    if (l1Target) {
+      recordClick(code);
+      return res.redirect(l1Target);
+    }
+
+    // --- TIER 2: Redis Cache (Single TCP hop) ---
+    const cached = await redis.get(`url:${code}`);
+    if (cached) {
+      const { og_url } = JSON.parse(cached);
+      urlL1Cache.set(code, og_url);
+      recordClick(code);
+      return res.redirect(og_url);
+    }
+
+    // --- TIER 3: PostgreSQL Database (Cache miss fallback) ---
     const result = await pool.query(
       'SELECT og_url FROM urls WHERE short_code = $1',
       [code]
     );
-    console.log('CACHE MISS');
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: 'Short URL not found' });
-    }
-  }
-
-  try {
-    const result = await pool.query(
-      'UPDATE urls SET click_cnt = click_cnt + 1 WHERE short_code = $1 RETURNING og_url',
-      [code]
-    );
 
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Short URL not found' });
     }
 
-    return res.redirect(result.rows[0].og_url);
-  }
-  catch (err) {
+    const { og_url } = result.rows[0];
+
+    // Populate L2 (Redis) & L1 (LRU) for subsequent requests
+    await redis.set(`url:${code}`, JSON.stringify(result.rows[0]), 'EX', 3600);
+    urlL1Cache.set(code, og_url);
+
+    // Buffer click in memory (persisted to Redis every 1s, DB every 5s)
+    recordClick(code);
+
+    return res.redirect(og_url);
+  } catch (err) {
     console.error(err);
     return res.status(500).json({ error: 'Failed to redirect' });
   }
