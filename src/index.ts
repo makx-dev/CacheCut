@@ -1,10 +1,10 @@
 
-import express from 'express';
 import dotenv from 'dotenv';
+dotenv.config();
+
+import express from 'express';
 import urlRoutes from './routes/url.routes';
 import { startClickSyncWorker } from './services/clickSync.service';
-
-dotenv.config();
 
 const app = express();
 app.disable('x-powered-by');

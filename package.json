@@ -8,7 +8,8 @@
     "build": "tsc",
     "prestart": "npm run build",
     "start": "node dist/index.js",
-    "bench:postgres": "autocannon -c 50 -d 10 http://localhost:3000/1C"
+    "bench:postgres": "autocannon -c 50 -d 10 http://localhost:3000/1C",
+    "check:clicks": "node -e \"require('dotenv').config(); const { Pool } = require('pg'); new Pool({ connectionString: process.env.DATABASE_URL }).query('SELECT short_code, og_url, click_cnt FROM urls ORDER BY created_at DESC LIMIT 5').then(r => { console.table(r.rows); process.exit(0); });\""
   },
   "repository": {
     "type": "git",
