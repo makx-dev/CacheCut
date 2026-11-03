@@ -111,11 +111,10 @@ export const startClickSyncWorker = (flushIntervalMs = 1000, dbSyncIntervalMs = 
     });
   }, flushIntervalMs);
 
-  dbSyncTimer = setInterval(() => {
-    syncClicksToDatabase().catch((err) => {
-      console.error('Error syncing clicks to PostgreSQL:', err);
-    });
-  }, dbSyncIntervalMs);
+  // NOTE: Database persistence (Redis -> PostgreSQL) is now delegated to the Qrew Distributed Worker.
+  // Qrew runs a repeatable BullMQ job every 5s with Redlock serialization, exponential backoff, and DLQ.
+  // dbSyncTimer is disabled to avoid uncoordinated, duplicate database updates.
+  console.log('[CacheCut] Click buffer active (flushing memory -> Redis every 1s). DB sync offloaded to Qrew.');
 
   // Graceful shutdown handling on SIGINT/SIGTERM
   let isShuttingDown = false;
