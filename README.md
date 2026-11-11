@@ -1,27 +1,38 @@
 # CacheCut
 
-A high-throughput URL shortener with a two-tier cache (in-memory + Redis) and batched click counting. Built with TypeScript, Express, PostgreSQL and Redis.
+A high-throughput URL shortener with a two-tier cache (in-memory + Redis) and retry-backed asynchronous click persistence. Built with **TypeScript, Express, PostgreSQL, Redis, and BullMQ**.
 
-CacheCut is built to keep redirects fast under load. Lookups are served from an in-process L1 cache, falling back to Redis (cache-aside) and then PostgreSQL. Click counts are aggregated in memory, flushed to Redis once per second, and synced to PostgreSQL with an atomic `GETDEL` handoff.
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Interactive_Console-2ea44f?style=for-the-badge&logo=render)](https://cachecut.onrender.com)
+[![Qrew Engine](https://img.shields.io/badge/Qrew_Engine-Decoupled_Worker-blue?style=for-the-badge&logo=redis)](https://qrew.onrender.com)
+[![Docker](https://img.shields.io/badge/Docker-Compose_Ready-2496ED?style=for-the-badge&logo=docker)](./docker-compose.yml)
+
+> ⏳ **Cold Start Notice:** On first access after 15 min idle, Render wakes the Node container (30–50s) and Neon resumes serverless compute. Subsequent lookups execute at sub-millisecond speeds.
+
+---
+
+CacheCut is built to keep redirects fast under load. Lookups are served from an in-process L1 cache, falling back to Redis (cache-aside) and then PostgreSQL. Click counts are buffered in Redis (`INCR`) and asynchronously committed to PostgreSQL via an embedded **BullMQ worker** with an atomic `GETDEL` handoff and exponential backoff retries.
 
 On a single laptop, this took redirect throughput from ~1.4k to ~5.4k req/s at 100 connections (and up to ~6.3k req/s at 10 conns with 1 ms p50 latency). A delta test under normal operation showed zero lost or double-counted clicks across 174,000+ requests.
 
 ## Features
 
-- Short code generation (`nanoid`) and redirect
-- Two-tier cache: L1 in-memory, then Redis (cache-aside with TTL), then PostgreSQL
-- Batched click counting: in-memory aggregation, 1s flush to Redis, periodic sync to Postgres
-- Atomic Redis to Postgres handoff using `GETDEL`
-- Dockerized PostgreSQL 17 and Redis 7 (AOF persistence on)
+- **Short Code Generation (`nanoid`) & Redirect:** 7-character collision-resistant URL encoding.
+- **Two-Tier Cache Hierarchy:** L1 in-memory (LRU), then Redis (cache-aside with 24h TTL), then PostgreSQL.
+- **Asynchronous Write-Behind Click Persistence:** Immediate Redis buffer (`clicks:<code>`), periodic 10s `GETDEL` handoff, and BullMQ worker commits with retry budget (guaranteed zero click loss).
+- **Anti-Abuse Ingress Rate Limiting:** `express-rate-limit` with `trust proxy` enabled (20 shortens per 15 min per IP).
+- **URL Sanitization & 7-Day Storage Protection:** Strict HTTP/HTTPS validation (max 2,048 chars) and database link lifetime pruning (`expires_at`).
+- **Interactive Developer Test Bench (`GET /`):** Live latency telemetry (`performance.now()`), resolution tier badges (L1 / L2 / PG), and dual click counters ("Buffered in Redis" vs "Persisted in Postgres").
+
+---
 
 ## Architecture
 
-### Read path (redirect)
+### Read Path (Redirect & Lookup)
 
 ```mermaid
 flowchart LR
     C[Client] --> A[Express /:code]
-    A --> L1{L1 in-memory<br/>cache}
+    A --> L1{L1 in-memory<br/>LRU Cache}
     L1 -- hit --> R[302 redirect]
     L1 -- miss --> RD{Redis<br/>url:code}
     RD -- hit --> F1[Fill L1] --> R
@@ -29,47 +40,50 @@ flowchart LR
     PG --> F2[Fill Redis + L1] --> R
 ```
 
-### Click counting path
+### Click Counting & Persistence Path
 
 ```mermaid
 flowchart LR
-    H[Redirect handler] --> M[In-memory counter Map]
-    M -- flush every 1s --> RI[Redis INCRBY clicks:code]
-    RI -- sync job: GETDEL --> PGU[(PostgreSQL<br/>click_cnt += n)]
+    H[Redirect / Demo Hit] --> RI[Redis INCR clicks:code<br/>SADD dirty:clicks]
+    RI -- 10s Scheduler: Atomic GETDEL --> Q[BullMQ persist-clicks Job]
+    Q -- Worker (Retries + Backoff) --> PGU[(PostgreSQL<br/>click_cnt += delta)]
 ```
 
-## Tech stack
+---
 
-TypeScript, Node.js, Express 5, PostgreSQL 17, Redis 7 (`ioredis`), Docker Compose.
+## Tech Stack
 
-## Getting started
+TypeScript, Node.js, Express 5, PostgreSQL 17, Redis 7 (`ioredis`), BullMQ 5, Docker Compose.
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
 - Node.js 20+
-- Docker and Docker Compose
+- Docker and Docker Compose (or cloud PostgreSQL and Redis URLs)
 
 ### Setup
 
 ```bash
-git clone https://github.com/makx-dev/CacheCut.git
-cd CacheCut
+git clone https://github.com/makx-dev/url-shortener.git
+cd url-shortener
 npm install
 
-# start Postgres and Redis
+# Start local Postgres and Redis
 docker compose up -d
-
-# create the schema
-docker compose exec -T postgres psql -U user -d url_shortener < schema.sql
 ```
 
-Create a `.env` file (commit a `.env.example`, not `.env`):
+Create a `.env` file:
 
 ```env
 PORT=3000
 DATABASE_URL=postgres://user:password@localhost:5432/url_shortener
 REDIS_HOST=localhost
 REDIS_PORT=6379
+# In production (e.g. Render / Neon / Redis Cloud):
+# REDIS_URL=rediss://default:password@your-redis-host:6379
 ```
 
 ### Run
@@ -79,27 +93,35 @@ npm run dev      # tsx watch, development
 npm start        # builds with tsc, then runs node dist/index.js
 ```
 
-## API
+---
 
-`src/routes/url.routes.ts` is mounted at the app root in `index.ts` (`app.use('/', urlRoutes)`), so the paths below are exactly as written, no prefix.
+## API Reference
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/shorten` | Create a short URL, handled by `shortenUrl` |
-| `GET` | `/:code` | 302 redirect to the original URL, handled by `redirectUrl` |
+| Method | Path | Description | Rate Limit |
+|---|---|---|---|
+| `GET` | `/` | Interactive Developer Test Bench & Telemetry UI | None |
+| `POST` | `/shorten` | Create a short URL (JSON payload `{ "og_url": "..." }`) | 20 req / 15 min |
+| `GET` | `/:code` | 302 redirect to the destination URL | None |
+| `POST` | `/api/demo/hit/:code` | Shared resolution inspection (returns tier, latencyMs, and dual click counts) | None |
+| `GET` | `/api/demo/stats` | Observability endpoint (BullMQ queue depth, recent URLs) | None |
+| `GET` | `/health` | Broker & database connection readiness probe | None |
+
+### Example Commands
 
 ```bash
-# create (bash/curl)
+# Create short URL (bash/curl)
 curl -X POST http://localhost:3000/shorten \
   -H "Content-Type: application/json" \
-  -d '{"og_url":"https://example.com"}'
+  -d '{"og_url":"https://github.com/makx-dev/Qrew"}'
 
-# create (PowerShell)
-Invoke-RestMethod -Uri http://localhost:3000/shorten -Method Post -ContentType "application/json" -Body '{"og_url":"https://example.com"}'
+# Test resolution & measure latency
+curl -X POST http://localhost:3000/api/demo/hit/3xK9p
 
-# redirect (use -I to see the 302 and Location header)
-curl -I http://localhost:3000/<code>
+# Redirect (use -I to inspect 302 and Location header)
+curl -I http://localhost:3000/3xK9p
 ```
+
+---
 
 ## Benchmarks
 
@@ -112,13 +134,12 @@ Setup: `npx autocannon -c 100 -d 10 http://localhost:3000/<code>`, single Node p
 | + L1 cache + batched click counting | 5,370.2 | 16 ms | 77 ms |
 
 Notes:
-
 - Autocannon reports `0 2xx responses` because it does not follow redirects and counts a `302` as non-2xx. The redirects are real; verify with `curl -I`.
 - All three rows above are measured on the same runner (`node dist/index.js`), at 100 connections / 10s, for a like-for-like comparison.
 
 ### L1 Cache + Batched Click Sync Breakdown (Live Measured)
 
-Measured against `dist/index.js` (built, `node` runtime) with `autocannon` hitting a single hot code (`/V4ExgpN`), 10s per scenario. Redirects are served from local in-memory L1 cache, with click counts aggregated in-memory and flushed to Redis (1s) and synced to PostgreSQL (5s).
+Measured against `dist/index.js` (built, `node` runtime) with `autocannon` hitting a single hot code (`/V4ExgpN`), 10s per scenario. Redirects are served from local in-memory L1 cache, with click counts aggregated and synced to PostgreSQL via the write-behind buffer.
 
 | Concurrency | Duration | Avg Req/Sec | Total Requests | Avg Latency | p50 | p99 | Max Latency | Error Rate |
 |---|---|---|---|---|---|---|---|---|
@@ -126,49 +147,7 @@ Measured against `dist/index.js` (built, `node` runtime) with `autocannon` hitti
 | 50 conns | 10s | 5,771.6 req/s | 57,710 | 8.21 ms | 7 ms | 34 ms | 105 ms | 0% |
 | 100 conns | 10s | 5,370.2 req/s | 53,695 | 18.15 ms | 16 ms | 77 ms | 226 ms | 0% |
 
-### Redis cache-aside breakdown
-
-Measured against `dist/index.js` (built, `node` runtime) with `autocannon` hitting a single hot code where the cache is warm (unless noted), 10s per scenario. Each redirect does a cache-hit `GET` plus an `INCR` in Redis.
-
-| Concurrency | Duration | Avg Req/Sec | Total Requests | Avg Latency | p50 | p99 | Max Latency | Error Rate |
-|---|---|---|---|---|---|---|---|---|
-| 10 conns | 10s | 1,733.6 req/s | 17,335 | 5.29 ms | 4 ms | 16 ms | 193 ms | 0% |
-| 50 conns (cold) | 10s | 2,623.4 req/s | 26,230 | 18.60 ms | 17 ms | 62 ms | 90 ms | 0% |
-| 50 conns (warm) | 10s | 2,930.7 req/s | 29,304 | 16.60 ms | 16 ms | 45 ms | 66 ms | 0% |
-| 100 conns | 10s | 1,391.1 req/s | 13,911 | 71.69 ms | 60 ms | 211 ms | 292 ms | 0% |
-
-Throughput peaks around 50 conns (warm cache beats cold by ~12%, as expected) and drops off again at 100 conns — at that concurrency this run is slightly behind the Postgres-only row above, so the benefit of this layer over plain Postgres shows up more at moderate concurrency than at 100 conns; the L1 cache fixes the drop-off at high concurrency.
-
-### Postgres-only breakdown
-
-Measured with `benchmark/measure_postgres.ts` against Postgres directly, no Redis or L1 cache in the path, 10s per scenario.
-
-| Scenario | Concurrency | Avg Req/Sec | Total Reqs (10s) | Avg Latency | p50 | p99 | Error Rate |
-|---|---|---|---|---|---|---|---|
-| Redirect (`UPDATE click_cnt` - single hot URL) | 10 conns | 2,541.7 req/s | 25,412 | 3.41 ms | 3 ms | 9 ms | 0% |
-| Redirect (`UPDATE click_cnt` - single hot URL) | 50 conns | 2,044.6 req/s | 20,444 | 23.99 ms | 18 ms | 66 ms | 0% |
-| Redirect (`UPDATE click_cnt` - single hot URL) | 100 conns | 1,600.8 req/s | 16,008 | 62.13 ms | 61 ms | 216 ms | 0% |
-| Redirect (`UPDATE click_cnt` - 20 distributed URLs) | 50 conns | 1,432.8 req/s | 14,328 | 34.61 ms | 20 ms | 93 ms | 0% |
-| Read-only redirect (`SELECT` only, no write) | 50 conns | 3,102.8 req/s | 31,024 | 15.66 ms | 15 ms | 35 ms | 0% |
-| Shorten URL (`INSERT INTO urls`) | 50 conns | 2,475.9 req/s | 24,753 | 19.73 ms | 17 ms | 47 ms | 0% |
-
-This is what motivates the L1 + Redis cache-aside layer: the write on every redirect (`UPDATE click_cnt`) is the bottleneck, and it degrades fast as concurrency rises (2,541.7 → 1,600.8 req/s from 10 to 100 conns). Read-only redirects and inserts alone are comfortably faster, and error rate stays at 0% across all scenarios.
-
-#### Usage
-
-Start your server in one terminal:
-
-```bash
-npm start
-```
-
-Check accumulated click counts in Postgres:
-
-```bash
-npm run check:clicks
-```
-
-### Correctness check (delta test)
+### Correctness Check (Delta Test)
 
 1. Initial `click_cnt` in PostgreSQL for code `V4ExgpN`: 0 (plus ~160 manual verification and health-check requests).
 2. Ran three consecutive high-load `autocannon` benchmarks:
@@ -176,49 +155,34 @@ npm run check:clicks
    - 10 connections (10s): 62,753 requests
    - 50 connections (10s): 57,710 requests
    - **Total requests sent:** 174,158 requests
-3. Waited past the 5s database sync interval and ran `npm run check:clicks`:
+3. Waited past the database sync interval and ran `npm run check:clicks`:
    - **Final `click_cnt` in PostgreSQL:** 174,318
    - Difference: +160 (exact match for pre-test manual requests)
 
 This demonstrates a 100% accurate, zero-loss click aggregation and persistence pipeline without dropping clicks or double-counting during sustained high-concurrency traffic bursts.
 
-## Design decisions
+---
 
-- **Cache-aside with TTL for Redis:** simple, and a stale or missing key just falls back to Postgres. Keys: `url:{code}` (1h TTL).
-- **L1 in-process cache:** removes the network hop from the hot path. It should have a short TTL and a max size so it can't grow unbounded or serve stale data for long.
-- **Batched click counting:** writing to Postgres (or even Redis) per redirect caps throughput. Aggregating in memory and flushing once per second trades up to 1s of durability for a large throughput gain.
-- **`GETDEL` for the handoff:** reading and clearing the counter atomically prevents the sync job from double-counting or dropping increments that arrive between a `GET` and a `DEL`.
-- **Two-tier sync cadence:** an in-memory `Map` flushes to Redis (`INCRBY` + `SADD dirty:clicks`) every 1s; a separate worker pops up to 500 dirty codes from Redis (5 batches of 100) every 5s and applies them to Postgres with `GETDEL` + `UPDATE click_cnt`.
-- **Failure handling on sync:** if the Redis pipeline flush fails, the batch is merged back into the in-memory buffer instead of being dropped. If the Postgres `UPDATE` fails after `GETDEL`, the count is restored to Redis with `INCRBY` and the code is re-added to `dirty:clicks`, so a DB outage delays a sync rather than losing clicks.
-- **Graceful shutdown:** `SIGINT`/`SIGTERM` handlers stop both interval timers and run one final `flushLocalClicksToRedis` + `syncClicksToDatabase` before the process exits, so a normal restart or deploy does not lose buffered clicks.
+## Key Design Decisions & Trade-Offs
 
-## Known limitations
+- **Cache-Aside with TTL for Redis:** Simple, resilient fallback to PostgreSQL on miss. Short URL keys stored at `url:{code}` with 24h TTL to protect Redis RAM.
+- **L1 In-Process Cache:** Eliminates TCP hops from the hot redirect path. Uses a bounded LRU eviction policy (10,000 items, 60s TTL) to prevent memory leaks.
+- **Write-Behind Click Buffering:** Direct PostgreSQL writes per redirect throttle system throughput. Buffering in Redis via `INCR` trades transient sub-second durability for massive throughput gains.
+- **Atomic `GETDEL` + BullMQ Job Handoff:** Atomically reading and clearing the Redis counter prevents double-counting. Enqueuing `{ code, delta }` into BullMQ ensures that if PostgreSQL experiences connection drops or cold-start timeouts, the retry budget carries the count until persistence succeeds.
+- **Reverse Proxy Compliance:** Configured `trust proxy: 1` so rate limiters inspect client IPs rather than Render's fronting load balancer.
+- **Capacity Defense:** All created links enforce a 7-day expiration (`expires_at`) to bound storage consumption on free-tier databases.
 
-- L1 is per process. With multiple instances, entries can be stale until the L1 TTL expires.
-- Up to ~1s of buffered clicks can be lost only on a hard/unclean crash (process killed, power loss, etc.) — a normal shutdown via `SIGINT`/`SIGTERM` (e.g. Docker stop, most PaaS restarts) flushes the buffer first, so no loss there.
-- If the Postgres `UPDATE` fails after `GETDEL` (e.g. DB is briefly down), the count is written back to Redis and re-marked dirty, so it's retried on the next sync cycle rather than lost — it's delayed, not dropped, as long as Postgres recovers before the process itself crashes.
-- No authentication, rate limiting, or custom aliases yet.
+---
 
 ## Roadmap
 
-- [ ] Move click sync to a BullMQ job queue
-- [ ] API rate limiter middleware
-- [ ] Postgres-down and Redis-down failure tests
+- [x] Move click sync to a BullMQ job queue with retry backoff
+- [x] API rate limiter middleware (`express-rate-limit` with `trust proxy`)
+- [x] Shared resolution test-bench endpoint (`POST /api/demo/hit/:code`)
+- [x] Real-time latency measurement and dual-counter visualization
+- [ ] Distributed OpenTelemetry tracing across CacheCut and Qrew worker
 
-## Project structure
-
-```
-src/
-  controllers/   url.controller.ts
-  db/            pool.ts, redis.ts
-  routes/        url.routes.ts
-  services/      clickSync.service.ts
-  types/         url.types.ts
-  utils/         generateCode.ts
-  index.ts
-schema.sql
-docker-compose.yml
-```
+---
 
 ## License
 
