@@ -130,7 +130,7 @@ export async function createShortUrl(ogUrl: string): Promise<UrlRecord> {
  */
 export async function resolveUrl(
   code: string,
-  options?: { flushTier?: 'L1' | 'L2' | 'all'; fetchRealPersisted?: boolean }
+  options?: { flushTier?: 'L1' | 'L2' | 'all' | undefined; fetchRealPersisted?: boolean | undefined }
 ): Promise<ResolveResult | null> {
   if (!code || typeof code !== 'string') return null;
 

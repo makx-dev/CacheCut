@@ -2,7 +2,6 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 import express, { Request, Response } from 'express';
-import rateLimit from 'express-rate-limit';
 import urlRoutes from './routes/url.routes';
 import { initDb } from './db/migrate';
 import { redis } from './db/redis';
@@ -22,21 +21,7 @@ app.disable('x-powered-by');
 app.disable('etag');
 app.use(express.json({ limit: '10kb' }));
 
-// 2. Anti-Abuse Rate Limiter for Shortening (20 per 15 minutes per IP)
-const shortenLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: 'Too Many Requests',
-    message: 'Rate limit exceeded: Max 20 shortens per 15 min per IP in this demo.',
-  },
-});
-
-app.use('/shorten', shortenLimiter);
-
-// 3. Health & Readiness Endpoint
+// 2. Health & Readiness Endpoint
 app.get('/health', async (_req: Request, res: Response) => {
   try {
     const [dbRes, redisPong] = await Promise.all([

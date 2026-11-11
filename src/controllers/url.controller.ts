@@ -68,7 +68,13 @@ export const redirectUrl = async (req: Request, res: Response) => {
  */
 export const demoHitUrl = async (req: Request, res: Response) => {
   const { code } = req.params;
-  const flushTier = (req.query.flush as 'L1' | 'L2' | 'all') || (req.body?.flushTier as 'L1' | 'L2' | 'all') || undefined;
+  
+  // Strictly allow only 'L1' or 'L2' to prevent arbitrary parameter abuse
+  let flushTier: 'L1' | 'L2' | undefined = undefined;
+  const rawFlush = req.query.flush || req.body?.flushTier;
+  if (rawFlush === 'L1' || rawFlush === 'L2') {
+    flushTier = rawFlush;
+  }
 
   if (!code || typeof code !== 'string') {
     return res.status(400).json({ error: 'Invalid short code' });
