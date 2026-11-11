@@ -629,7 +629,9 @@ app.get('/', async (_req: Request, res: Response) => {
         const data = await res.json();
 
         if (!res.ok) {
-          alert('Resolution error: ' + (data.error || 'Failed'));
+          const tierEl = document.getElementById('telemetryTier');
+          tierEl.className = 'telemetry-val tier-badge';
+          tierEl.textContent = data.error || 'Not Found';
           return;
         }
 
