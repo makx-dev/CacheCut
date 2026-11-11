@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 const connectionString = process.env.DATABASE_URL;
-const requiresSsl = connectionString?.includes('sslmode=require') || connectionString?.includes('neon.tech');
+const requiresSsl = connectionString?.includes('sslmode=') || connectionString?.includes('neon.tech');
 
 export const pool = new Pool({
   connectionString,

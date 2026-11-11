@@ -6,14 +6,13 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "prestart": "npm run build",
     "start": "node dist/index.js",
     "bench:postgres": "autocannon -c 50 -d 10 http://localhost:3000/1C",
     "check:clicks": "node -e \"require('dotenv').config(); const { Pool } = require('pg'); new Pool({ connectionString: process.env.DATABASE_URL }).query('SELECT short_code, og_url, click_cnt FROM urls ORDER BY created_at DESC LIMIT 5').then(r => { console.table(r.rows); process.exit(0); });\""
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/makx-dev/url-shortener.git"
+    "url": "git+https://github.com/makx-dev/CacheCut.git"
   },
   "keywords": [],
   "author": "",
@@ -36,7 +35,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^26.5.1",
     "@types/pg": "^8.23.1",
-    "autocannon": "^8.0.0",
+    "autocannon": "^9.0.0",
     "tsx": "^4.19.3",
     "typescript": "^7.0.2"
   }
