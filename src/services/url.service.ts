@@ -26,7 +26,6 @@ export interface UrlRecord {
 interface CachedUrlData {
   ogUrl: string;
   expiresAt: string | null;
-  clickCnt: number;
 }
 
 // Tier 1 In-Memory LRU Cache: 10,000 entries, 60s TTL
@@ -59,6 +58,21 @@ export function validateLongUrl(urlStr: string): { valid: boolean; error?: strin
     return { valid: true };
   } catch {
     return { valid: false, error: 'Malformed URL format. Ensure protocol (https://) is included.' };
+  }
+}
+
+/**
+ * Flushes specific cache tiers for demonstration / tier-switching showcase.
+ */
+export async function flushCacheTier(code: string, tier: 'L1' | 'L2' | 'all'): Promise<void> {
+  if (tier === 'L1' || tier === 'all') {
+    urlL1Cache.delete(code);
+  }
+  if (tier === 'L2' || tier === 'all') {
+    urlL1Cache.delete(code);
+    try {
+      await redis.del(`url:${code}`);
+    } catch {}
   }
 }
 
@@ -98,12 +112,11 @@ export async function createShortUrl(ogUrl: string): Promise<UrlRecord> {
   urlL1Cache.set(shortCode, {
     ogUrl: record.ogUrl,
     expiresAt: record.expiresAt,
-    clickCnt: record.clickCnt,
   });
 
   await redis.set(
     `url:${shortCode}`,
-    JSON.stringify({ ogUrl: record.ogUrl, expiresAt: record.expiresAt, clickCnt: record.clickCnt }),
+    JSON.stringify({ ogUrl: record.ogUrl, expiresAt: record.expiresAt }),
     'EX',
     REDIS_CACHE_TTL
   );
@@ -115,128 +128,146 @@ export async function createShortUrl(ogUrl: string): Promise<UrlRecord> {
  * Shared URL resolution engine: Used by both the real 302 redirect and the interactive demo endpoint.
  * Measures real latency dynamically via performance.now() across L1, L2, and Postgres tiers.
  */
-export async function resolveUrl(code: string): Promise<ResolveResult | null> {
+export async function resolveUrl(
+  code: string,
+  options?: { flushTier?: 'L1' | 'L2' | 'all'; fetchRealPersisted?: boolean }
+): Promise<ResolveResult | null> {
   if (!code || typeof code !== 'string') return null;
+
+  // Handle tier eviction simulation for live demo testing
+  if (options?.flushTier) {
+    await flushCacheTier(code, options.flushTier);
+  }
+
   const start = performance.now();
+  let result: {
+    ogUrl: string;
+    tier: 'L1' | 'L2' | 'PG';
+    latencyMs: number;
+    expired: boolean;
+    expiresAt: string | null;
+  } | null = null;
 
   // --- TIER 1: In-Memory LRU Cache ---
   const l1Target = urlL1Cache.get(code);
   if (l1Target) {
     const latencyMs = Number((performance.now() - start).toFixed(2));
     const isExpired = l1Target.expiresAt ? new Date(l1Target.expiresAt).getTime() < Date.now() : false;
-
-    if (!isExpired) {
-      recordClick(code).catch(() => {});
-    }
-
-    const bufferedClicks = await getBufferedClicks(code);
-    return {
-      shortCode: code,
+    result = {
       ogUrl: l1Target.ogUrl,
       tier: 'L1',
       latencyMs,
       expired: isExpired,
-      bufferedClicks,
-      persistedClicks: l1Target.clickCnt,
       expiresAt: l1Target.expiresAt,
     };
   }
 
   // --- TIER 2: Redis Cache (Single TCP roundtrip) ---
-  try {
-    const cachedRaw = await redis.get(`url:${code}`);
-    if (cachedRaw) {
-      const parsed: CachedUrlData = JSON.parse(cachedRaw);
-      const latencyMs = Number((performance.now() - start).toFixed(2));
-      const isExpired = parsed.expiresAt ? new Date(parsed.expiresAt).getTime() < Date.now() : false;
+  if (!result) {
+    try {
+      const cachedRaw = await redis.get(`url:${code}`);
+      if (cachedRaw) {
+        const parsed: CachedUrlData = JSON.parse(cachedRaw);
+        const latencyMs = Number((performance.now() - start).toFixed(2));
+        const isExpired = parsed.expiresAt ? new Date(parsed.expiresAt).getTime() < Date.now() : false;
 
-      // Backfill L1 Cache
-      urlL1Cache.set(code, parsed);
+        // Backfill L1 Cache
+        urlL1Cache.set(code, parsed);
 
-      if (!isExpired) {
-        recordClick(code).catch(() => {});
+        result = {
+          ogUrl: parsed.ogUrl,
+          tier: 'L2',
+          latencyMs,
+          expired: isExpired,
+          expiresAt: parsed.expiresAt,
+        };
       }
-
-      const bufferedClicks = await getBufferedClicks(code);
-      return {
-        shortCode: code,
-        ogUrl: parsed.ogUrl,
-        tier: 'L2',
-        latencyMs,
-        expired: isExpired,
-        bufferedClicks,
-        persistedClicks: parsed.clickCnt,
-        expiresAt: parsed.expiresAt,
-      };
+    } catch (err: any) {
+      console.warn(`[CacheCut] Redis cache read failed for ${code}:`, err.message);
     }
-  } catch (err: any) {
-    console.warn(`[CacheCut] Redis cache read failed for ${code}:`, err.message);
   }
 
   // --- TIER 3: PostgreSQL Fallback (ACID Persistence) ---
-  const dbResult = await pool.query(
-    'SELECT short_code, og_url, created_at, click_cnt, expires_at FROM urls WHERE short_code = $1',
-    [code]
-  );
+  if (!result) {
+    const dbResult = await pool.query(
+      'SELECT short_code, og_url, created_at, click_cnt, expires_at FROM urls WHERE short_code = $1',
+      [code]
+    );
 
-  if (dbResult.rowCount === 0) {
-    return null;
+    if (dbResult.rowCount === 0) {
+      return null;
+    }
+
+    const row = dbResult.rows[0];
+    const latencyMs = Number((performance.now() - start).toFixed(2));
+    const isExpired = row.expires_at ? new Date(row.expires_at).getTime() < Date.now() : false;
+    const urlData: CachedUrlData = {
+      ogUrl: row.og_url,
+      expiresAt: row.expires_at,
+    };
+
+    // Backfill both L1 and L2 caches
+    urlL1Cache.set(code, urlData);
+    redis
+      .set(`url:${code}`, JSON.stringify(urlData), 'EX', REDIS_CACHE_TTL)
+      .catch(() => {});
+
+    result = {
+      ogUrl: row.og_url,
+      tier: 'PG',
+      latencyMs,
+      expired: isExpired,
+      expiresAt: row.expires_at,
+    };
   }
 
-  const row = dbResult.rows[0];
-  const latencyMs = Number((performance.now() - start).toFixed(2));
-  const isExpired = row.expires_at ? new Date(row.expires_at).getTime() < Date.now() : false;
-  const urlData: CachedUrlData = {
-    ogUrl: row.og_url,
-    expiresAt: row.expires_at,
-    clickCnt: row.click_cnt || 0,
-  };
-
-  // Backfill both L1 and L2 caches
-  urlL1Cache.set(code, urlData);
-  redis
-    .set(`url:${code}`, JSON.stringify(urlData), 'EX', REDIS_CACHE_TTL)
-    .catch(() => {});
-
-  if (!isExpired) {
+  if (!result.expired) {
     recordClick(code).catch(() => {});
   }
 
+  // Fetch telemetry counts
   const bufferedClicks = await getBufferedClicks(code);
+  let persistedClicks = 0;
+
+  if (options?.fetchRealPersisted) {
+    try {
+      const dbClicksRes = await pool.query('SELECT click_cnt FROM urls WHERE short_code = $1', [code]);
+      persistedClicks = dbClicksRes.rows[0]?.click_cnt || 0;
+    } catch {
+      persistedClicks = 0;
+    }
+  }
+
   return {
     shortCode: code,
-    ogUrl: row.og_url,
-    tier: 'PG',
-    latencyMs,
-    expired: isExpired,
+    ogUrl: result.ogUrl,
+    tier: result.tier,
+    latencyMs: result.latencyMs,
+    expired: result.expired,
     bufferedClicks,
-    persistedClicks: row.click_cnt || 0,
-    expiresAt: row.expires_at,
+    persistedClicks,
+    expiresAt: result.expiresAt,
   };
 }
 
 /**
- * Fetches recent active links for the demo overview.
+ * Returns safe, curated public demo links (prevents leaking private user URLs).
  */
-export async function getRecentUrls(limit = 10): Promise<UrlRecord[]> {
-  try {
-    const result = await pool.query(
-      `SELECT short_code, og_url, created_at, expires_at, click_cnt
-       FROM urls
-       ORDER BY created_at DESC
-       LIMIT $1`,
-      [limit]
-    );
-
-    return result.rows.map((row) => ({
-      shortCode: row.short_code,
-      ogUrl: row.og_url,
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-      clickCnt: row.click_cnt || 0,
-    }));
-  } catch {
-    return [];
-  }
+export function getSeededDemoUrls(): UrlRecord[] {
+  return [
+    {
+      shortCode: 'cachecut-repo',
+      ogUrl: 'https://github.com/makx-dev/CacheCut',
+      createdAt: '2026-11-11T00:00:00.000Z',
+      expiresAt: null,
+      clickCnt: 101,
+    },
+    {
+      shortCode: 'qrew-engine',
+      ogUrl: 'https://github.com/makx-dev/Qrew',
+      createdAt: '2026-11-11T00:00:00.000Z',
+      expiresAt: null,
+      clickCnt: 42,
+    },
+  ];
 }
-

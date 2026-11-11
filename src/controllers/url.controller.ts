@@ -3,9 +3,9 @@ import {
   createShortUrl,
   resolveUrl,
   validateLongUrl,
-  getRecentUrls,
+  getSeededDemoUrls,
 } from '../services/url.service';
-import { getClickQueueMetrics, getBufferedClicks } from '../services/clickSyncQueue';
+import { getClickQueueMetrics } from '../services/clickSyncQueue';
 
 /**
  * POST /shorten
@@ -64,17 +64,21 @@ export const redirectUrl = async (req: Request, res: Response) => {
 /**
  * POST /api/demo/hit/:code
  * Used by the portfolio interactive UI to simulate a redirect inspection without browser-opaque 302 masking.
- * Shares the exact same resolution function, returning live measured latency, tier hit, and dual counters.
+ * Supports ?flush=L1 (to test L2 Redis hit) and ?flush=L2 (to test PG fallback).
  */
 export const demoHitUrl = async (req: Request, res: Response) => {
   const { code } = req.params;
+  const flushTier = (req.query.flush as 'L1' | 'L2' | 'all') || (req.body?.flushTier as 'L1' | 'L2' | 'all') || undefined;
 
   if (!code || typeof code !== 'string') {
     return res.status(400).json({ error: 'Invalid short code' });
   }
 
   try {
-    const result = await resolveUrl(code);
+    const result = await resolveUrl(code, {
+      flushTier,
+      fetchRealPersisted: true,
+    });
 
     if (!result) {
       return res.status(404).json({ error: 'Short URL not found' });
@@ -88,19 +92,18 @@ export const demoHitUrl = async (req: Request, res: Response) => {
 
 /**
  * GET /api/demo/stats
- * Telemetry endpoint exposing queue depth, buffered clicks, and recent URLs for portfolio observability.
+ * Telemetry endpoint exposing queue depth, buffered clicks, and seeded demo URLs (prevents leaking private visitor URLs).
  */
 export const demoStats = async (_req: Request, res: Response) => {
   try {
-    const [queueMetrics, recentUrls] = await Promise.all([
+    const [queueMetrics] = await Promise.all([
       getClickQueueMetrics(),
-      getRecentUrls(8),
     ]);
 
     return res.json({
       status: 'healthy',
       queue: queueMetrics,
-      recent: recentUrls,
+      seededDemoLinks: getSeededDemoUrls(),
       timestamp: new Date().toISOString(),
     });
   } catch (err: any) {

@@ -12,7 +12,6 @@ import {
   shutdownClickSync,
   getClickQueueMetrics,
 } from './services/clickSyncQueue';
-import { getRecentUrls } from './services/url.service';
 
 const app = express();
 
@@ -65,9 +64,6 @@ app.get('/health', async (_req: Request, res: Response) => {
 
 // 4. Interactive Portfolio Landing Page
 app.get('/', async (_req: Request, res: Response) => {
-  const recentUrls = await getRecentUrls(5);
-  const queueMetrics = await getClickQueueMetrics();
-
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -284,6 +280,7 @@ app.get('/', async (_req: Request, res: Response) => {
     .action-group {
       display: flex;
       gap: 8px;
+      flex-wrap: wrap;
     }
 
     .btn-sm {
@@ -297,6 +294,7 @@ app.get('/', async (_req: Request, res: Response) => {
       display: inline-flex;
       align-items: center;
       gap: 6px;
+      transition: all 0.15s ease;
     }
     .btn-sm:hover { background: #334155; }
 
@@ -413,7 +411,7 @@ app.get('/', async (_req: Request, res: Response) => {
       <div class="nav-links">
         <a href="/health" class="nav-pill" target="_blank"><i data-lucide="activity" style="width: 14px; height: 14px;"></i> /health</a>
         <a href="https://qrew.onrender.com" class="nav-pill" target="_blank"><i data-lucide="cpu" style="width: 14px; height: 14px;"></i> Qrew Engine</a>
-        <a href="https://github.com/makx-dev/url-shortener" class="nav-pill" target="_blank"><i data-lucide="github" style="width: 14px; height: 14px;"></i> GitHub</a>
+        <a href="https://github.com/makx-dev/CacheCut" class="nav-pill" target="_blank"><i data-lucide="github" style="width: 14px; height: 14px;"></i> GitHub</a>
       </div>
     </header>
 
@@ -455,8 +453,14 @@ app.get('/', async (_req: Request, res: Response) => {
             <a href="#" id="realRedirectBtn" class="btn-sm" target="_blank" style="text-decoration: none;">
               <i data-lucide="external-link" style="width: 14px; height: 14px;"></i> 302 Redirect
             </a>
-            <button class="btn-sm" id="testHitBtn" onclick="runInspectionHit()" style="border-color: var(--primary); color: #93c5fd;">
-              <i data-lucide="gauge" style="width: 14px; height: 14px;"></i> Test Hit (Inspect Tiers)
+            <button class="btn-sm" onclick="runInspectionHit()" style="border-color: #10b981; color: #6ee7b7;" title="Test normal lookup (hits L1 Memory)">
+              <i data-lucide="zap" style="width: 14px; height: 14px;"></i> Test Hit (L1)
+            </button>
+            <button class="btn-sm" onclick="runInspectionHit('L1')" style="border-color: #3b82f6; color: #93c5fd;" title="Flush L1 memory cache and hit L2 Redis">
+              <i data-lucide="refresh-cw" style="width: 14px; height: 14px;"></i> Flush L1 &rarr; Test L2
+            </button>
+            <button class="btn-sm" onclick="runInspectionHit('L2')" style="border-color: #f59e0b; color: #fde68a;" title="Flush L1 & Redis and hit PostgreSQL">
+              <i data-lucide="database" style="width: 14px; height: 14px;"></i> Flush L1+L2 &rarr; Test PG
             </button>
           </div>
         </div>
@@ -482,7 +486,7 @@ app.get('/', async (_req: Request, res: Response) => {
         </div>
 
         <div class="arch-explainer">
-          <strong>Write-Behind Persistence:</strong> Clicks accumulate in Redis instantly (<code>clicks:code</code>). Every 10 seconds, the embedded BullMQ batch worker performs an atomic <code>GETDEL</code> handoff and commits the accumulated delta to PostgreSQL.
+          <strong>Interactive Cache Tier Testing:</strong> Click <em>"Flush L1"</em> to simulate an in-process cache miss and watch the request resolve from L2 Redis. Click <em>"Flush L1+L2"</em> to evict both and observe PostgreSQL fallback.
         </div>
       </div>
     </div>
@@ -490,27 +494,23 @@ app.get('/', async (_req: Request, res: Response) => {
     <!-- Active Demo Links Table -->
     <div class="card">
       <div class="card-title">
-        <i data-lucide="database" style="width: 16px; height: 16px; color: var(--purple);"></i>
-        Recent Short Links in Database
+        <i data-lucide="shield-check" style="width: 16px; height: 16px; color: var(--purple);"></i>
+        Your Session Links &amp; Seeded Demos
+      </div>
+      <div style="font-size: 11px; color: var(--text-dim); margin-top: -8px; margin-bottom: 14px;">
+        🔒 <strong>Privacy Guard:</strong> Strangers' links are never shown publicly. Only curated portfolio demos and links created in your active browser session are displayed.
       </div>
       <table>
         <thead>
           <tr>
             <th>Short Code</th>
             <th>Original Destination</th>
-            <th>Persisted Clicks</th>
+            <th>Type</th>
             <th>Inspect</th>
           </tr>
         </thead>
-        <tbody id="recentTableBody">
-          ${recentUrls.length === 0 ? '<tr><td colspan="4" style="text-align: center; color: var(--text-dim); padding: 20px;">No links created yet. Create one above!</td></tr>' : recentUrls.map(u => `
-            <tr>
-              <td><a href="/${u.shortCode}" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">/${u.shortCode}</a></td>
-              <td class="target-url" title="${u.ogUrl}">${u.ogUrl}</td>
-              <td style="color: var(--success); font-weight: 600;">${u.clickCnt}</td>
-              <td><button class="btn-sm" onclick="selectCode('${u.shortCode}')"><i data-lucide="play" style="width: 12px; height: 12px;"></i> Inspect</button></td>
-            </tr>
-          `).join('')}
+        <tbody id="sessionLinksTableBody">
+          <!-- Populated dynamically via JavaScript -->
         </tbody>
       </table>
     </div>
@@ -526,6 +526,50 @@ app.get('/', async (_req: Request, res: Response) => {
     lucide.createIcons();
 
     let currentCode = null;
+
+    // Seeded public demo links
+    const SEEDED_DEMOS = [
+      { shortCode: 'cachecut-repo', ogUrl: 'https://github.com/makx-dev/CacheCut', type: 'Seeded Demo' },
+      { shortCode: 'qrew-engine', ogUrl: 'https://github.com/makx-dev/Qrew', type: 'Seeded Demo' }
+    ];
+
+    function getSessionLinks() {
+      try {
+        const stored = sessionStorage.getItem('cachecut_links');
+        return stored ? JSON.parse(stored) : [];
+      } catch {
+        return [];
+      }
+    }
+
+    function saveSessionLink(code, url) {
+      try {
+        const list = getSessionLinks();
+        if (!list.some(item => item.shortCode === code)) {
+          list.unshift({ shortCode: code, ogUrl: url, type: 'This Session' });
+          sessionStorage.setItem('cachecut_links', JSON.stringify(list.slice(0, 10)));
+        }
+      } catch {}
+    }
+
+    function renderLinksTable() {
+      const tbody = document.getElementById('sessionLinksTableBody');
+      const sessionList = getSessionLinks();
+      const allLinks = [...sessionList, ...SEEDED_DEMOS];
+
+      tbody.innerHTML = allLinks.map(u => \`
+        <tr>
+          <td><a href="/\${u.shortCode}" target="_blank" style="color: #60a5fa; text-decoration: none; font-weight: 600;">/\${u.shortCode}</a></td>
+          <td class="target-url" title="\${u.ogUrl}">\${u.ogUrl}</td>
+          <td><span style="font-size: 10.5px; padding: 2px 6px; border-radius: 4px; background: #1e293b; color: #94a3b8;">\${u.type}</span></td>
+          <td><button class="btn-sm" onclick="selectCode('\${u.shortCode}')"><i data-lucide="play" style="width: 12px; height: 12px;"></i> Inspect</button></td>
+        </tr>
+      \`).join('');
+
+      lucide.createIcons();
+    }
+
+    renderLinksTable();
 
     async function handleShorten(e) {
       e.preventDefault();
@@ -550,6 +594,8 @@ app.get('/', async (_req: Request, res: Response) => {
           return;
         }
 
+        saveSessionLink(data.shortCode, data.ogUrl);
+        renderLinksTable();
         displayShortCode(data.shortCode);
         await runInspectionHit();
       } catch (err) {
@@ -574,13 +620,12 @@ app.get('/', async (_req: Request, res: Response) => {
       box.style.display = 'block';
     }
 
-    async function runInspectionHit() {
+    async function runInspectionHit(flushTier) {
       if (!currentCode) return;
-      const btn = document.getElementById('testHitBtn');
-      btn.disabled = true;
+      const url = flushTier ? '/api/demo/hit/' + currentCode + '?flush=' + flushTier : '/api/demo/hit/' + currentCode;
 
       try {
-        const res = await fetch('/api/demo/hit/' + currentCode, { method: 'POST' });
+        const res = await fetch(url, { method: 'POST' });
         const data = await res.json();
 
         if (!res.ok) {
@@ -591,7 +636,7 @@ app.get('/', async (_req: Request, res: Response) => {
         // Update Tier Badge
         const tierEl = document.getElementById('telemetryTier');
         tierEl.className = 'telemetry-val tier-badge tier-' + data.tier;
-        tierEl.textContent = data.tier === 'L1' ? 'L1 Memory (<1ms)' : data.tier === 'L2' ? 'L2 Redis (~2ms)' : 'PG Fallback';
+        tierEl.textContent = data.tier === 'L1' ? 'L1 Memory (<1ms)' : data.tier === 'L2' ? 'L2 Redis (~2ms)' : 'PG Fallback (~25ms)';
 
         // Update Latency
         document.getElementById('telemetryLatency').textContent = data.latencyMs + ' ms';
@@ -601,9 +646,6 @@ app.get('/', async (_req: Request, res: Response) => {
         document.getElementById('telemetryPersisted').textContent = data.persistedClicks;
       } catch (err) {
         console.error('Inspection failed:', err);
-      } finally {
-        btn.disabled = false;
-        lucide.createIcons();
       }
     }
 
