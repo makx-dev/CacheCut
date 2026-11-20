@@ -53,3 +53,4 @@ jobs:
             curl -f -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
             echo "CacheCut deployment triggered successfully!"
           fi
+
