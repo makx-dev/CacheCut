@@ -1,0 +1,55 @@
+name: CacheCut CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # ==========================================
+  # CI: Quality & Build Gatekeeper
+  # ==========================================
+  build-and-verify:
+    name: TypeScript Build & Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci --include=dev
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      - name: Security Vulnerability Audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+  # ==========================================
+  # CD: Deploy to Render (Only on main branch)
+  # ==========================================
+  deploy:
+    name: Trigger Render Deployment
+    needs: build-and-verify
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Render Deploy Hook
+        run: |
+          if [ -z "${{ secrets.RENDER_DEPLOY_HOOK }}" ]; then
+            echo "::warning ::RENDER_DEPLOY_HOOK secret is not set. Skipping automated deploy."
+          else
+            echo "Triggering CacheCut Render deployment..."
+            curl -f -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+            echo "CacheCut deployment triggered successfully!"
+          fi

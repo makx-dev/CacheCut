@@ -5,6 +5,7 @@ A high-throughput URL shortener with a two-tier cache (in-memory + Redis) and re
 [![Live Demo](https://img.shields.io/badge/Live_Demo-Interactive_Console-2ea44f?style=for-the-badge&logo=render)](https://cachecut.onrender.com)
 [![Qrew Engine](https://img.shields.io/badge/Qrew_Engine-Decoupled_Worker-blue?style=for-the-badge&logo=redis)](https://qrew.onrender.com)
 [![Docker](https://img.shields.io/badge/Docker-Compose_Ready-2496ED?style=for-the-badge&logo=docker)](./docker-compose.yml)
+[![CI/CD Pipeline](https://github.com/makx-dev/CacheCut/actions/workflows/ci-cd.yml/badge.svg)](https://github.com/makx-dev/CacheCut/actions/workflows/ci-cd.yml)
 
 > ⏳ **Cold Start Notice:** On first access after 15 min idle, Render wakes the Node container (30–50s) and Neon resumes serverless compute. Subsequent lookups execute at sub-millisecond speeds.
 
